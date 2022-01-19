@@ -2,3 +2,8 @@ mpi:
   - nompi
   - mpich  # [not win]
   - openmpi  # [not win]
+
+channel_sources:
+  - ramonaoptics,conda-forge
+channel_targets:
+  - ramonaoptics main
