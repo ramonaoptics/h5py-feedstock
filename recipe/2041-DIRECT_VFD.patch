@@ -1,0 +1,378 @@
+From 084252d224fbd8bcef924f6c14d14a9a8007a17b Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Tue, 18 Jan 2022 17:25:43 -0500
+Subject: [PATCH 1/3] Expose DIRECT VFD to Linux Users that have the required
+ support
+
+---
+ api_gen.py              |  9 ++++++++-
+ h5py/_hl/files.py       | 11 ++++++++++-
+ h5py/api_functions.txt  |  4 ++++
+ h5py/api_types_hdf5.pxd |  1 +
+ h5py/h5.pyx             |  8 ++++++++
+ h5py/h5fd.pyx           |  1 +
+ h5py/h5p.pyx            | 29 +++++++++++++++++++++++++++++
+ setup_build.py          |  2 ++
+ setup_configure.py      | 12 ++++++++++--
+ 9 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/api_gen.py b/api_gen.py
+index 4ba6b50a4..2f91b50c5 100644
+--- a/api_gen.py
++++ b/api_gen.py
+@@ -40,6 +40,7 @@ class Line:
+                     acquire the GIL (e.g. using 'with gil' in Cython).
+         mpi:        Bool indicating if MPI required
+         ros3:       Bool indicating if ROS3 required
++        direct_vfd: Bool indicating if DIRECT_VFD required
+         version:    None or a minimum-version tuple
+         code:       String with function return type
+         fname:      String with function name
+@@ -50,7 +51,8 @@ class Line:
+ 
+         .nogil:     ""
+         .mpi:       True
+-        .ros3:      True
++        .ros3:      False
++        .direct_vfd: False
+         .version:   (1, 8, 12)
+         .code:      "int"
+         .fname:     "foo"
+@@ -60,6 +62,7 @@ class Line:
+ 
+     PATTERN = re.compile("""(?P<mpi>(MPI)[ ]+)?
+                             (?P<ros3>(ROS3)[ ]+)?
++                            (?P<direct_vfd>(DIRECT_VFD)[ ]+)?
+                             (?P<min_version>([0-9]+\.[0-9]+\.[0-9]+))?
+                             (-(?P<max_version>([0-9]+\.[0-9]+\.[0-9]+)))?
+                             ([ ]+)?
+@@ -91,6 +94,7 @@ def __init__(self, text):
+         self.nogil = "nogil" if parts['nogil'] else ""
+         self.mpi = parts['mpi'] is not None
+         self.ros3 = parts['ros3'] is not None
++        self.direct_vfd = parts['direct_vfd'] is not None
+         self.min_version = parts['min_version']
+         if self.min_version is not None:
+             self.min_version = tuple(int(x) for x in self.min_version.split('.'))
+@@ -220,6 +224,9 @@ def wrapif(condition, code):
+         if self.line.ros3:
+             block = wrapif('ROS3', block)
+ 
++        if self.line.direct_vfd:
++            block = wrapif('DIRECT_VFD', block)
++
+         if self.line.min_version is not None and self.line.max_version is not None:
+             block = wrapif('HDF5_VERSION >= {0.min_version} and HDF5_VERSION <= {0.max_version}'.format(self.line), block)
+         elif self.line.min_version is not None:
+diff --git a/h5py/_hl/files.py b/h5py/_hl/files.py
+index 16bf08a3e..a5faf662e 100644
+--- a/h5py/_hl/files.py
++++ b/h5py/_hl/files.py
+@@ -24,6 +24,7 @@
+ 
+ mpi = h5.get_config().mpi
+ ros3 = h5.get_config().ros3
++direct_vfd = h5.get_config().direct_vfd
+ hdf5_version = version.hdf5_version_tuple[0:3]
+ 
+ swmr_support = False
+@@ -77,6 +78,9 @@ def _set_fapl_fileobj(plist, **kwargs):
+ if ros3:
+     _drivers['ros3'] = lambda plist, **kwargs: plist.set_fapl_ros3(**kwargs)
+ 
++if direct_vfd:
++    _drivers['direct'] = lambda plist, **kwargs: plist.set_fapl_direct(**kwargs)  # noqa
++
+ 
+ def register_driver(name, set_fapl):
+     """Register a custom driver.
+@@ -233,6 +237,9 @@ def make_fid(name, mode, userblock_size, fapl, fcpl=None, swmr=False):
+         # Not all drivers raise FileNotFoundError (commented those that do not)
+         except FileNotFoundError if fapl.get_driver() in (
+             h5fd.SEC2,
++            # 2022/01/19 hmaarrfk
++            # TODO: I'm not sure if this actually raises FileNotFoundError
++            h5fd.DIRECT if direct_vfd else -1,
+             # h5fd.STDIO,
+             # h5fd.CORE,
+             h5fd.FAMILY,
+@@ -293,6 +300,8 @@ def driver(self):
+                    h5fd.fileobj_driver: 'fileobj'}
+         if ros3:
+             drivers[h5fd.ROS3D] = 'ros3'
++        if direct_vfd:
++            drivers[h5fd.DIRECT] = 'direct'
+         return drivers.get(self.id.get_access_plist().get_driver(), 'unknown')
+ 
+     @property
+@@ -371,7 +380,7 @@ def __init__(self, name, mode='r', driver=None, libver=None, userblock_size=None
+             a        Read/write if exists, create otherwise
+         driver
+             Name of the driver to use.  Legal values are None (default,
+-            recommended), 'core', 'sec2', 'stdio', 'mpio', 'ros3'.
++            recommended), 'core', 'sec2', 'direct', 'stdio', 'mpio', 'ros3'.
+         libver
+             Library version bounds.  Supported values: 'earliest', 'v108',
+             'v110', 'v112'  and 'latest'. The 'v108', 'v110' and 'v112'
+diff --git a/h5py/api_functions.txt b/h5py/api_functions.txt
+index 22532b200..37558f5cb 100644
+--- a/h5py/api_functions.txt
++++ b/h5py/api_functions.txt
+@@ -22,6 +22,8 @@
+ #
+ # Function lines are C function signatures, optionally preceded by:
+ #   MPI     If present, function requires an MPI-aware build of h5py
++#   ROS3    If present, function requires a ROS3 enabled build of h5py
++#   DIRECT_VFD If present, function requires an DIRECT VFD enabled build of h5py
+ #   ERROR   Explicit error checks are needed (HDF5 does not use error stack)
+ #   X.Y.Z   Minimum version of HDF5 required for this function
+ #
+@@ -301,6 +303,8 @@ hdf5:
+   herr_t    H5Pget_family_offset ( hid_t fapl_id, hsize_t *offset)
+   ROS3 herr_t    H5Pget_fapl_ros3(hid_t fapl_id, H5FD_ros3_fapl_t *fa_out);
+   ROS3 herr_t    H5Pset_fapl_ros3(hid_t fapl_id, H5FD_ros3_fapl_t *fa);
++  DIRECT_VFD 1.8.0 herr_t H5Pget_fapl_direct(hid_t fapl_id, size_t *boundary, size_t *block_size, size_t *cbuf_size);
++  DIRECT_VFD 1.8.0 herr_t H5Pset_fapl_direct(hid_t fapl_id, size_t alignment, size_t block_size, size_t cbuf_size);
+   herr_t    H5Pset_fapl_log(hid_t fapl_id, char *logfile, unsigned int flags, size_t buf_size)
+   herr_t    H5Pset_fapl_multi(hid_t fapl_id, H5FD_mem_t *memb_map, hid_t *memb_fapl, const char * const *memb_name, haddr_t *memb_addr, hbool_t relax)
+   herr_t    H5Pset_cache(hid_t plist_id, int mdc_nelmts, int rdcc_nelmts,  size_t rdcc_nbytes, double rdcc_w0)
+diff --git a/h5py/api_types_hdf5.pxd b/h5py/api_types_hdf5.pxd
+index c957c6b9b..6977f1a7b 100644
+--- a/h5py/api_types_hdf5.pxd
++++ b/h5py/api_types_hdf5.pxd
+@@ -194,6 +194,7 @@ cdef extern from "hdf5.h":
+   hid_t H5FD_MPIO
+   hid_t H5FD_MULTI
+   hid_t H5FD_SEC2
++  hid_t H5FD_DIRECT
+   hid_t H5FD_STDIO
+   IF UNAME_SYSNAME == "Windows":
+     hid_t H5FD_WINDOWS
+diff --git a/h5py/h5.pyx b/h5py/h5.pyx
+index 4338b31a3..df882362a 100644
+--- a/h5py/h5.pyx
++++ b/h5py/h5.pyx
+@@ -144,6 +144,14 @@ cdef class H5PYConfig:
+             ELSE:
+                 return False
+ 
++    property direct_vfd:
++        """ Boolean indicating if DIRECT VFD is available """
++        def __get__(self):
++            IF DIRECT_VFD:
++                return True
++            ELSE:
++                return False
++
+     property swmr_min_hdf5_version:
+         """ Tuple indicating the minimum HDF5 version required for SWMR features"""
+         def __get__(self):
+diff --git a/h5py/h5fd.pyx b/h5py/h5fd.pyx
+index f8b0a418c..04aff0773 100644
+--- a/h5py/h5fd.pyx
++++ b/h5py/h5fd.pyx
+@@ -41,6 +41,7 @@ MPIO = H5FD_MPIO
+ MPIPOSIX = -1
+ MULTI = H5FD_MULTI
+ SEC2 = H5FD_SEC2
++DIRECT = H5FD_DIRECT
+ STDIO = H5FD_STDIO
+ IF HDF5_VERSION >= (1, 10, 6):
+     ROS3D = H5FD_ROS3
+diff --git a/h5py/h5p.pyx b/h5py/h5p.pyx
+index f7ef9adae..2820ac636 100644
+--- a/h5py/h5p.pyx
++++ b/h5py/h5p.pyx
+@@ -1102,6 +1102,34 @@ cdef class PropFAID(PropInstanceID):
+         """
+         H5Pset_fapl_sec2(self.id)
+ 
++    if DIRECT_VFD:
++        @with_phil
++        def set_fapl_direct(self, size_t alignment=4096, size_t block_size=0, size_t cbuf_size=4096):
++            """()
++
++            Select the "direct" driver (h5fd.DIRECT).
++
++            Parameters:
++                hid_t fapl_id       IN: File access property list identifier
++                size_t alignment    IN: Required memory alignment boundary
++                size_t block_size   IN: File system block size
++                size_t cbuf_size    IN: Copy buffer size
++            """
++            H5Pset_fapl_direct(self.id, alignment, block_size, cbuf_size)
++
++        @with_phil
++        def get_fapl_direct(self):
++            """ () => (alignment, block_size, cbuf_size)
++
++            Retrieve the DIRECT VFD config
++            """
++            cdef size_t alignment
++            cdef size_t block_size
++            cdef size_t cbuf_size
++
++            H5Pget_fapl_direct(self.id, &alignment, &block_size, &cbuf_size)
++            return alignment, block_size, cbuf_size
++
+ 
+     @with_phil
+     def set_fapl_stdio(self):
+@@ -1154,6 +1182,7 @@ cdef class PropFAID(PropInstanceID):
+         - h5fd.MPIO
+         - h5fd.MULTI
+         - h5fd.SEC2
++        - h5fd.DIRECT  (if available)
+         - h5fd.STDIO
+         """
+         return H5Pget_driver(self.id)
+diff --git a/setup_build.py b/setup_build.py
+index 6b66789cf..19387c735 100644
+--- a/setup_build.py
++++ b/setup_build.py
+@@ -147,6 +147,7 @@ def run(self):
+ 
+ DEF MPI = %(mpi)s
+ DEF ROS3 = %(ros3)s
++DEF DIRECT_VFD = %(direct_vfd)s
+ DEF HDF5_VERSION = %(version)s
+ DEF SWMR_MIN_HDF5_VERSION = (1,9,178)
+ DEF VDS_MIN_HDF5_VERSION = (1,9,233)
+@@ -158,6 +159,7 @@ def run(self):
+         s %= {
+             'mpi': bool(config.mpi),
+             'ros3': bool(config.ros3),
++            'direct_vfd': bool(config.direct_vfd),
+             'version': config.hdf5_version,
+             'complex256_support': hasattr(numpy, 'complex256'),
+             'numpy_version': numpy.__version__,
+diff --git a/setup_configure.py b/setup_configure.py
+index 16c355b0b..3b03f0fd3 100644
+--- a/setup_configure.py
++++ b/setup_configure.py
+@@ -54,13 +54,15 @@ def mpi_enabled():
+ 
+ 
+ class BuildConfig:
+-    def __init__(self, hdf5_includedirs, hdf5_libdirs, hdf5_define_macros, hdf5_version, mpi, ros3):
++    def __init__(self, hdf5_includedirs, hdf5_libdirs, hdf5_define_macros,
++                 hdf5_version, mpi, ros3, direct_vfd):
+         self.hdf5_includedirs = hdf5_includedirs
+         self.hdf5_libdirs = hdf5_libdirs
+         self.hdf5_define_macros = hdf5_define_macros
+         self.hdf5_version = hdf5_version
+         self.mpi = mpi
+         self.ros3 = ros3
++        self.direct_vfd = direct_vfd
+ 
+     @classmethod
+     def from_env(cls):
+@@ -77,8 +79,9 @@ def from_env(cls):
+             if mpi and not h5_wrapper.has_mpi_support():
+                 raise RuntimeError("MPI support not detected")
+         ros3 = h5_wrapper.has_ros3_support()
++        direct_vfd = h5_wrapper.has_direct_vfd_support()
+ 
+-        return cls(h5_inc, h5_lib, h5_macros, h5_version, mpi, ros3)
++        return cls(h5_inc, h5_lib, h5_macros, h5_version, mpi, ros3, direct_vfd)
+ 
+     @staticmethod
+     def _find_hdf5_compiler_settings(mpi=False):
+@@ -153,6 +156,7 @@ def as_dict(self):
+             'hdf5_version': list(self.hdf5_version),  # list() to match the JSON
+             'mpi': self.mpi,
+             'ros3': self.ros3,
++            'direct_vfd': self.direct_vfd,
+         }
+ 
+     def changed(self):
+@@ -175,6 +179,7 @@ def fmt_dirs(l):
+         print("     HDF5 Version:", repr(self.hdf5_version))
+         print("      MPI Enabled:", self.mpi)
+         print(" ROS3 VFD Enabled:", self.ros3)
++        print("DIRECT VFD Enabled:", self.direct_vfd)
+         print(" Rebuild Required:", self.changed())
+         print('')
+         print('*' * 80)
+@@ -281,3 +286,6 @@ def has_mpi_support(self):
+ 
+     def has_ros3_support(self):
+         return self.has_functions("H5Pget_fapl_ros3", "H5Pset_fapl_ros3")
++
++    def has_direct_vfd_support(self):
++        return self.has_functions("H5Pget_fapl_direct", "H5Pset_fapl_direct")
+
+From 751b981585e5ea7e29e79dc7cb18ca9d5e315a1a Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Wed, 19 Jan 2022 13:25:59 -0500
+Subject: [PATCH 2/3] BUILD: Add option to build DIRECT VFD for linux
+
+---
+ ci/get_hdf5_if_needed.sh | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/ci/get_hdf5_if_needed.sh b/ci/get_hdf5_if_needed.sh
+index e35a69ee6..68275c5ef 100755
+--- a/ci/get_hdf5_if_needed.sh
++++ b/ci/get_hdf5_if_needed.sh
+@@ -18,6 +18,10 @@ else
+         lib_name=libhdf5.dylib
+     else
+         lib_name=libhdf5.so
++        ENABLE_DIRECT_VFD="--enable-direct-vfd"
++    fi
++    if [[ "${HDF5_VERSION%.*}" = "1.12" ]]; then
++        ENABLE_BUILD_MODE="--enable-build-mode=production"
+     fi
+ 
+     if [ -f $HDF5_DIR/lib/$lib_name ]; then
+@@ -29,11 +33,10 @@ else
+         tar -xzvf hdf5-$HDF5_VERSION.tar.gz
+         pushd hdf5-$HDF5_VERSION
+         chmod u+x autogen.sh
+-        if [[ "${HDF5_VERSION%.*}" = "1.12" ]]; then
+-          ./configure --prefix $HDF5_DIR $EXTRA_MPI_FLAGS --enable-build-mode=production
+-        else
+-          ./configure --prefix $HDF5_DIR $EXTRA_MPI_FLAGS
+-        fi
++        ./configure --prefix $HDF5_DIR \
++            ${EXTRA_MPI_FLAGS} \
++            ${ENABLE_DIRECT_VFD} \
++            ${ENABLE_BUILD_MODE}
+         make -j $(nproc)
+         make install
+         popd
+
+From e30c9f284ddf0536f326e2504f3d298796b5e65e Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Wed, 19 Jan 2022 13:26:20 -0500
+Subject: [PATCH 3/3] REMOVE ME: Force rebuilding of HDF5
+
+---
+ ci/get_hdf5_if_needed.sh | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/ci/get_hdf5_if_needed.sh b/ci/get_hdf5_if_needed.sh
+index 68275c5ef..46b2a1602 100755
+--- a/ci/get_hdf5_if_needed.sh
++++ b/ci/get_hdf5_if_needed.sh
+@@ -24,9 +24,9 @@ else
+         ENABLE_BUILD_MODE="--enable-build-mode=production"
+     fi
+ 
+-    if [ -f $HDF5_DIR/lib/$lib_name ]; then
+-        echo "using cached build"
+-    else
++    # if [ -f $HDF5_DIR/lib/$lib_name ]; then
++    #     echo "using cached build"
++    # else
+         pushd /tmp
+         #                                   Remove trailing .*, to get e.g. '1.12' ↓
+         curl -fsSLO "https://www.hdfgroup.org/ftp/HDF5/releases/hdf5-${HDF5_VERSION%.*}/hdf5-$HDF5_VERSION/src/hdf5-$HDF5_VERSION.tar.gz"
+@@ -41,5 +41,5 @@ else
+         make install
+         popd
+         popd
+-    fi
++    # fi
+ fi

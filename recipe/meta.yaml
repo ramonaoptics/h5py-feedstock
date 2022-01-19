@@ -9,6 +9,9 @@
 {% set build = build + 100 %}
 {% endif %}
 
+# Add 500 to the build numbers to indicate Ramona Optics builds
+{% set build = build + 500 %}
+
 package:
   name: h5py
   version: {{ version }}
@@ -19,6 +22,11 @@ source:
   patches:
     - osx-arm64.diff    # [osx and arm64]
     - osx-arm64-hdf5.diff    # [build_platform != target_platform]
+    # https://github.com/h5py/h5py/pull/2040
+    - 2040-data_alignment.patch
+    # https://github.com/h5py/h5py/pull/2041/
+    - 2041-DIRECT_VFD.patch
+    - version_bump_post1.py
 
 build:
   skip: true  # [py<=36]

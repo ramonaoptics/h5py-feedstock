@@ -1,0 +1,234 @@
+From 460e6e2cb9b91fddb97c554b6e1f41ef4d4e7813 Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Tue, 18 Jan 2022 18:32:01 -0500
+Subject: [PATCH 1/2] Add options to the File constructor to set the data
+ alignment
+
+---
+ h5py/_hl/files.py                 |  20 +++++-
+ h5py/tests/test_file_alignment.py | 106 ++++++++++++++++++++++++++++++
+ 2 files changed, 123 insertions(+), 3 deletions(-)
+ create mode 100644 h5py/tests/test_file_alignment.py
+
+diff --git a/h5py/_hl/files.py b/h5py/_hl/files.py
+index 16bf08a3e..6d6e0b670 100644
+--- a/h5py/_hl/files.py
++++ b/h5py/_hl/files.py
+@@ -109,7 +109,8 @@ def registered_drivers():
+ 
+ 
+ def make_fapl(driver, libver, rdcc_nslots, rdcc_nbytes, rdcc_w0, locking,
+-              page_buf_size, min_meta_keep, min_raw_keep, **kwds):
++              page_buf_size, min_meta_keep, min_raw_keep,
++              alignment_threshold, alignment_interval, **kwds):
+     """ Set up a file access property list """
+     plist = h5p.create(h5p.FILE_ACCESS)
+ 
+@@ -123,6 +124,7 @@ def make_fapl(driver, libver, rdcc_nslots, rdcc_nbytes, rdcc_w0, locking,
+         # we default to earliest
+         low, high = h5f.LIBVER_EARLIEST, h5f.LIBVER_LATEST
+     plist.set_libver_bounds(low, high)
++    plist.set_alignment(alignment_threshold, alignment_interval)
+ 
+     cache_settings = list(plist.get_cache())
+     if rdcc_nslots is not None:
+@@ -354,7 +356,8 @@ def swmr_mode(self, value):
+     def __init__(self, name, mode='r', driver=None, libver=None, userblock_size=None, swmr=False,
+                  rdcc_nslots=None, rdcc_nbytes=None, rdcc_w0=None, track_order=None,
+                  fs_strategy=None, fs_persist=False, fs_threshold=1, fs_page_size=None,
+-                 page_buf_size=None, min_meta_keep=0, min_raw_keep=0, locking=None, **kwds):
++                 page_buf_size=None, min_meta_keep=0, min_raw_keep=0, locking=None,
++                 alignment_threshold=1, alignment_interval=1, **kwds):
+         """Create a new file object.
+ 
+         See the h5py user guide for a detailed explanation of the options.
+@@ -449,6 +452,14 @@ def __init__(self, name, mode='r', driver=None, libver=None, userblock_size=None
+             Warning: The HDF5_USE_FILE_LOCKING environment variable can override
+             this parameter.
+             Only available with HDF5 >= 1.12.1 or 1.10.x >= 1.10.7.
++
++        alignment_threshold
++            See https://support.hdfgroup.org/HDF5/doc/RM/RM_H5P.html#Property-SetAlignment for
++            more details.
++        alignment_interval
++            See https://support.hdfgroup.org/HDF5/doc/RM/RM_H5P.html#Property-SetAlignment for
++            more details.
++
+         Additional keywords
+             Passed on to the selected file driver.
+         """
+@@ -500,7 +511,10 @@ def __init__(self, name, mode='r', driver=None, libver=None, userblock_size=None
+ 
+             with phil:
+                 fapl = make_fapl(driver, libver, rdcc_nslots, rdcc_nbytes, rdcc_w0,
+-                                 locking, page_buf_size, min_meta_keep, min_raw_keep, **kwds)
++                                 locking, page_buf_size, min_meta_keep, min_raw_keep,
++                                 alignment_threshold=alignment_threshold,
++                                 alignment_interval=alignment_interval,
++                                 **kwds)
+                 fcpl = make_fcpl(track_order=track_order, fs_strategy=fs_strategy,
+                                  fs_persist=fs_persist, fs_threshold=fs_threshold,
+                                  fs_page_size=fs_page_size)
+diff --git a/h5py/tests/test_file_alignment.py b/h5py/tests/test_file_alignment.py
+new file mode 100644
+index 000000000..83f554448
+--- /dev/null
++++ b/h5py/tests/test_file_alignment.py
+@@ -0,0 +1,106 @@
++import h5py
++from .common import TestCase
++
++
++def is_aligned(dataset, offset=4096):
++    # Here we check if the dataset is aligned
++    return dataset.id.get_offset() % offset == 0
++
++
++def dataset_name(i):
++    return f"data{i:03}"
++
++
++class TestFileAlignment(TestCase):
++    """
++        Ensure that setting the file alignment has the desired effect
++        in the internal structure.
++    """
++    def test_no_alignment_set(self):
++        fname = self.mktemp()
++        # 881 is a prime number, so hopefully this help randomize the alignment
++        # enough
++        # A nice even number might give a pathological case where
++        # While we don't want the data to be aligned, it ends up aligned...
++        shape = (881,)
++
++        with h5py.File(fname, 'w') as h5file:
++            # Create up to 1000 datasets
++            # At least one of them should be misaligned.
++            # While this isn't perfect, it seems that there
++            # The case where 1000 datasets get created is one where the data
++            # is aligned. Therefore, during correct operation, this test is
++            # expected to finish quickly
++            for i in range(1000):
++                dataset = h5file.create_dataset(
++                    dataset_name(i), shape, dtype='uint8')
++                # Assign data so that the dataset is instantiated in
++                # the file
++                dataset[...] = i
++                if not is_aligned(dataset):
++                    # Break early asserting that the file is not aligned
++                    break
++            else:
++                raise RuntimeError("Data was all found to be aligned to 4096")
++
++    def test_alignment_set_above_threshold(self):
++        # 2022/01/19 hmaarrfk
++        # UnitTest (TestCase) doesn't play well with pytest parametrization.
++        alignment_threshold = 1000
++        alignment_interval = 4096
++
++        for shape in [
++            (1033,),  # A prime number above the thresold
++            (1000,),  # Exactly equal to the threshold
++            (1001,),  # one above the threshold
++        ]:
++            fname = self.mktemp()
++            with h5py.File(fname, 'w',
++                           alignment_threshold=alignment_threshold,
++                           alignment_interval=alignment_interval) as h5file:
++                # Create up to 1000 datasets
++                # They are all expected to be aligned
++                for i in range(1000):
++                    dataset = h5file.create_dataset(
++                        dataset_name(i), shape, dtype='uint8')
++                    # Assign data so that the dataset is instantiated in
++                    # the file
++                    dataset[...] = i
++                    if not is_aligned(dataset, offset=alignment_interval):
++                        raise RuntimeError(
++                            "All data was expected to be aligned to "
++                            f"{alignment_interval}.")
++
++    def test_alignment_set_below_threshold(self):
++        # 2022/01/19 hmaarrfk
++        # UnitTest (TestCase) doesn't play well with pytest parametrization.
++        alignment_threshold = 1000
++        alignment_interval = 1024
++
++        for shape in [
++            (881,),  # A prime number below the thresold
++            (999,),  # Exactly one below the threshold
++        ]:
++            fname = self.mktemp()
++            with h5py.File(fname, 'w',
++                           alignment_threshold=alignment_threshold,
++                           alignment_interval=alignment_interval) as h5file:
++                # Create up to 1000 datasets
++                # At least one of them should be misaligned.
++                # While this isn't perfect, it seems that there
++                # The case where 1000 datasets get created is one where the
++                # data is aligned. Therefore, during correct operation, this
++                # test is expected to finish quickly
++                for i in range(1000):
++                    dataset = h5file.create_dataset(
++                        dataset_name(i), shape, dtype='uint8')
++                    # Assign data so that the dataset is instantiated in
++                    # the file
++                    dataset[...] = i
++                    if not is_aligned(dataset, offset=alignment_interval):
++                        # Break early asserting that the file is not aligned
++                        break
++                else:
++                    raise RuntimeError(
++                        "Data was all found to be aligned to "
++                        f"{alignment_interval}. This is highly unlikely.")
+
+From 7005ccb1ceb570715c59e3e506d58a00282e25cf Mon Sep 17 00:00:00 2001
+From: Mark Harfouche <mark.harfouche@gmail.com>
+Date: Wed, 19 Jan 2022 12:16:24 -0500
+Subject: [PATCH 2/2] Add release note for 2040 (enabling data alignment in
+ constructor)
+
+---
+ news/enable_file_alignment.rst | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+ create mode 100644 news/enable_file_alignment.rst
+
+diff --git a/news/enable_file_alignment.rst b/news/enable_file_alignment.rst
+new file mode 100644
+index 000000000..31ebccd13
+--- /dev/null
++++ b/news/enable_file_alignment.rst
+@@ -0,0 +1,33 @@
++New features
++------------
++
++* The ``File`` constructor contains two new parameters ``alignment_threshold``,
++  and ``alignment_interval`` controling the data alignment within the HDF5
++  file.
++
++Deprecations
++------------
++
++* <news item>
++
++Exposing HDF5 functions
++-----------------------
++
++* The functionality provided by ``H5Pset_alignment`` is exposed to the end user
++  through two new parameters ``alignment_threshold`` and ``alignment_interval``
++  in the ``File`` constructor.
++
++Bug fixes
++---------
++
++* <news item>
++
++Building h5py
++-------------
++
++* <news item>
++
++Development
++-----------
++
++* <news item>
