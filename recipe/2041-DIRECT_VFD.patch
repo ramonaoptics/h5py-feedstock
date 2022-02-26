@@ -189,7 +189,7 @@ index f7ef9adae..2820ac636 100644
  
 +    if DIRECT_VFD:
 +        @with_phil
-+        def set_fapl_direct(self, size_t alignment=4096, size_t block_size=0, size_t cbuf_size=4096):
++        def set_fapl_direct(self, size_t alignment=0, size_t block_size=0, size_t cbuf_size=0):
 +            """()
 +
 +            Select the "direct" driver (h5fd.DIRECT).
